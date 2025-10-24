@@ -198,7 +198,7 @@ class OAuthInteractiveGrantClient:
         with requests.Session() as session:
             if refresh_token:
                 try:
-                    token_response = self.refresh_token(session)
+                    token_response = self.refresh_token(session, refresh_token)
                     return OAuthInteractiveGrantClientCredentials(
                         access_token=token_response["access_token"],
                         expires_in=token_response["expires_in"],
@@ -298,10 +298,10 @@ class OAuthInteractiveGrantClient:
                     raise RuntimeError(f"Token polling failed ({resp.status_code}): {payload}")
                 time.sleep(interval)
 
-    def refresh_token(self, session: requests.Session) -> Dict[str, Any]:
+    def refresh_token(self, session: requests.Session, refresh_token: str) -> Dict[str, Any]:
         data = {
             "grant_type": "refresh_token",
-            "refresh_token": self.current_token.refresh_token,
+            "refresh_token": refresh_token,
             "client_id": self.client_id,
             "client_secret": self.client_secret
         }
@@ -365,7 +365,10 @@ class OAuthClientInteractiveGrantAuthProvider(AuthCredentialProvider):
         with self.lock:
             if self.current_token and not self.needs_refresh(self.current_token):
                 return self.current_token
-            new_token = self.oauth_client.client_credentials()
+            refresh_token = None
+            if self.current_token:
+                refresh_token = self.current_token.refresh_token
+            new_token = self.oauth_client.client_credentials(refresh_token=refresh_token)
             self.current_token = new_token
             return new_token
 
@@ -378,7 +381,7 @@ class OAuthClientInteractiveGrantAuthProvider(AuthCredentialProvider):
         return None
 
 class AuthCredentialProviderFactory:
-    __oauth_auth_provider_cache: Dict[DeltaSharingProfile, OAuthClientCredentialsAuthProvider] = {}
+    __oauth_auth_provider_cache: Dict[DeltaSharingProfile, OAuthClientCredentialsAuthProvider | OAuthClientInteractiveGrantAuthProvider] = {}
 
     @staticmethod
     def create_auth_credential_provider(profile: DeltaSharingProfile):
@@ -438,6 +441,8 @@ class AuthCredentialProviderFactory:
     
     @staticmethod
     def __oauth_client_interactive_grant(profile):
+        if profile in AuthCredentialProviderFactory.__oauth_auth_provider_cache:
+            return AuthCredentialProviderFactory.__oauth_auth_provider_cache[profile]
         well_known_url = f"{profile.issuer}/.well-known/openid-configuration"
         try:
             response = requests.get(well_known_url)
@@ -460,7 +465,7 @@ class AuthCredentialProviderFactory:
             scope=profile.scope,
         )
         provider = OAuthClientInteractiveGrantAuthProvider(
-            oauth_client=client, auth_config=AuthConfig()
+            oauth_client=client, auth_config=AuthConfig(token_renewal_threshold_in_seconds=60)
         )
         AuthCredentialProviderFactory.__oauth_auth_provider_cache[profile] = provider
         return provider
