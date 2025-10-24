@@ -16,7 +16,7 @@
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 import requests
 import base64
 import json
@@ -112,6 +112,20 @@ class OAuthClientCredentials:
         self.expires_in = expires_in
         self.creation_timestamp = creation_timestamp
 
+class OAuthInteractiveGrantClientCredentials(OAuthClientCredentials):
+    def __init__(
+        self,
+        access_token: str,
+        expires_in: int,
+        creation_timestamp: int,
+        refresh_token: str,
+        scope: str,
+    ):
+        super().__init__(access_token, expires_in, creation_timestamp)
+        self.refresh_token = refresh_token
+        self.scope = scope
+
+
 
 class OAuthClient:
     def __init__(
@@ -168,6 +182,136 @@ class OAuthClient:
             json_node["access_token"], expires_in, int(datetime.now().timestamp())
         )
 
+class OAuthInteractiveGrantClient:
+    def __init__(
+        self, issuer: str, client_id: str, token_url: str, refresh_url: str, device_auth_url: str, client_secret: Optional[str] = None, scope: Optional[str] = None
+    ):
+        self.issuer = issuer
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.scope = scope
+        self.token_url = token_url
+        self.refresh_url = refresh_url
+        self.device_auth_url = device_auth_url
+
+    def client_credentials(self, refresh_token: Optional[str] = None) -> OAuthInteractiveGrantClientCredentials:
+        with requests.Session() as session:
+            if refresh_token:
+                try:
+                    token_response = self.refresh_token(session)
+                    return OAuthInteractiveGrantClientCredentials(
+                        access_token=token_response["access_token"],
+                        expires_in=token_response["expires_in"],
+                        creation_timestamp=int(datetime.now().timestamp()),
+                        refresh_token=token_response.get("refresh_token", refresh_token),
+                        scope=token_response.get("scope", self.scope),
+                    )
+                except Exception as e:
+                    print(f"Refresh token failed: {e}. Falling back to device authorization flow.")
+            # 1) Start device authorization
+            device = self.start_device_authorization(session)
+
+            # 2) Tell the user what to do (copy/paste friendly)
+            print("\n=== Delta Sharing OIDC (Device Flow) ===\n")
+            print("Please complete sign-in on any browser:")
+            print(f"  Verification URL: {device['verification_uri']}")
+            # Some Keycloak versions also provide 'verification_uri_complete'
+            if "verification_uri_complete" in device:
+                print(f"  (Direct link):    {device['verification_uri_complete']}")
+            print(f"  User code:        {device['user_code']}\n")
+
+            # 3) Poll until the user finishes
+            print(f"Waiting for authorization.  Timeout in {device['expires_in']} seconds...")
+            token_response = self.poll_for_token(session, device)
+            return OAuthInteractiveGrantClientCredentials(
+                access_token=token_response["access_token"],
+                expires_in=token_response["expires_in"],
+                creation_timestamp=int(datetime.now().timestamp()),
+                refresh_token=token_response.get("refresh_token", ""),
+                scope=token_response.get("scope", self.scope),
+            )
+
+
+    def start_device_authorization(self, session: requests.Session) -> Dict[str, Any]:
+        """Initiate device authorization; return device_code payload."""
+        data = {
+            "client_id": self.client_id,
+            "scope": self.scope,
+            "client_secret": self.client_secret,
+        }
+        # RFC 8628 recommends application/x-www-form-urlencoded
+        resp = session.post(self.device_auth_url, data=data, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        required = {"device_code", "user_code", "verification_uri", "expires_in"}
+        if not required.issubset(payload):
+            raise RuntimeError(f"Unexpected device response: {payload}")
+        return payload
+    
+    def poll_for_token(self, session: requests.Session, device: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Poll Keycloak token endpoint with the device_code until:
+        - access_token is returned, or
+        - the device code expires, or
+        - an error occurs.
+        Handles authorization_pending / slow_down per RFC 8628.
+        """
+        device_code = device["device_code"]
+        interval = int(device.get("interval", 5))  # default polling interval seconds
+        deadline = time.time() + int(device["expires_in"])
+
+        while True:
+            if time.time() >= deadline:
+                raise TimeoutError("Device code expired before authorization was completed.")
+
+            data = {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret
+            }
+            resp = session.post(self.token_url, data=data, timeout=30)
+            # 200 OK => either tokens or error JSON
+            try:
+                payload = resp.json()
+            except Exception:
+                resp.raise_for_status()
+                payload = {}  # unreachable if above succeeds
+
+            if "access_token" in payload:
+                return payload
+
+            error = payload.get("error")
+            if error == "authorization_pending":
+                time.sleep(interval)
+                continue
+            elif error == "slow_down":
+                interval += 5
+                time.sleep(interval)
+                continue
+            elif error in {"expired_token", "access_denied"}:
+                raise RuntimeError(f"Authorization failed: {error}")
+            else:
+                # Could be invalid_client, invalid_scope, etc.
+                # If HTTP status indicates a hard failure, raise; otherwise show payload.
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Token polling failed ({resp.status_code}): {payload}")
+                time.sleep(interval)
+
+    def refresh_token(self, session: requests.Session) -> Dict[str, Any]:
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.current_token.refresh_token,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret
+        }
+        resp = session.post(self.token_url, data=data, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        if "access_token" not in payload:
+            raise RuntimeError(f"Unexpected refresh token response: {payload}")
+        return payload
+
 
 class OAuthClientCredentialsAuthProvider(AuthCredentialProvider):
     def __init__(self, oauth_client: OAuthClient, auth_config: AuthConfig = AuthConfig()):
@@ -201,13 +345,49 @@ class OAuthClientCredentialsAuthProvider(AuthCredentialProvider):
     def get_expiration_time(self) -> Optional[str]:
         return None
 
+class OAuthClientInteractiveGrantAuthProvider(AuthCredentialProvider):
+    def __init__(self, oauth_client: OAuthInteractiveGrantClient, auth_config: AuthConfig = AuthConfig()):
+        self.auth_config = auth_config
+        self.oauth_client = oauth_client
+        self.current_token: Optional[OAuthInteractiveGrantClientCredentials] = None
+        self.lock = threading.RLock()
+
+    def add_auth_header(self, session: requests.Session) -> None:
+        token = self.maybe_refresh_token()
+        with self.lock:
+            session.headers.update(
+                {
+                    "Authorization": f"Bearer {token.access_token}",
+                }
+            )
+
+    def maybe_refresh_token(self) -> OAuthInteractiveGrantClientCredentials:
+        with self.lock:
+            if self.current_token and not self.needs_refresh(self.current_token):
+                return self.current_token
+            new_token = self.oauth_client.client_credentials()
+            self.current_token = new_token
+            return new_token
+
+    def needs_refresh(self, token: OAuthInteractiveGrantClientCredentials) -> bool:
+        now = int(time.time())
+        expiration_time = token.creation_timestamp + token.expires_in
+        return expiration_time - now < self.auth_config.token_renewal_threshold_in_seconds
+
+    def get_expiration_time(self) -> Optional[str]:
+        return None
 
 class AuthCredentialProviderFactory:
     __oauth_auth_provider_cache: Dict[DeltaSharingProfile, OAuthClientCredentialsAuthProvider] = {}
 
     @staticmethod
     def create_auth_credential_provider(profile: DeltaSharingProfile):
-        if profile.share_credentials_version == 2:
+        if profile.share_credentials_version == 3:
+            if profile.type == "oauth_client_oidc_interactive":
+                return AuthCredentialProviderFactory.__oauth_client_interactive_grant(profile)
+            elif profile.type == "basic":
+                return AuthCredentialProviderFactory.__auth_basic(profile)
+        elif profile.share_credentials_version == 2:
             if profile.type == "oauth_client_credentials":
                 return AuthCredentialProviderFactory.__oauth_client_credentials(profile)
             elif profile.type == "basic":
@@ -255,3 +435,32 @@ class AuthCredentialProviderFactory:
     @staticmethod
     def __auth_basic(profile):
         return BasicAuthProvider(profile.endpoint, profile.username, profile.password)
+    
+    @staticmethod
+    def __oauth_client_interactive_grant(profile):
+        well_known_url = f"{profile.issuer}/.well-known/openid-configuration"
+        try:
+            response = requests.get(well_known_url)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            print(f"Error fetching well-known configuration: {e}")
+            return None
+        config = response.json()
+        if not config.get("device_authorization_endpoint"):
+            raise RuntimeError(
+                f"Device authorization endpoint not found in well-known configuration from {well_known_url}"
+            )
+        client = OAuthInteractiveGrantClient(
+            issuer=profile.issuer,
+            client_id=profile.client_id,
+            token_url=config.get("token_endpoint"),
+            refresh_url=config.get("token_endpoint"),
+            device_auth_url=config.get("device_authorization_endpoint"),
+            client_secret=profile.client_secret,
+            scope=profile.scope,
+        )
+        provider = OAuthClientInteractiveGrantAuthProvider(
+            oauth_client=client, auth_config=AuthConfig()
+        )
+        AuthCredentialProviderFactory.__oauth_auth_provider_cache[profile] = provider
+        return provider

@@ -23,7 +23,7 @@ import fsspec
 
 @dataclass(frozen=True)
 class DeltaSharingProfile:
-    CURRENT: ClassVar[int] = 2
+    CURRENT: ClassVar[int] = 3
 
     share_credentials_version: int
     endpoint: str
@@ -36,6 +36,7 @@ class DeltaSharingProfile:
     username: Optional[str] = None
     password: Optional[str] = None
     scope: Optional[str] = None
+    issuer: Optional[str] = None
 
     def __post_init__(self):
         if self.share_credentials_version > DeltaSharingProfile.CURRENT:
@@ -106,6 +107,24 @@ class DeltaSharingProfile:
                     endpoint=endpoint,
                     username=json["username"],
                     password=json["password"],
+                )
+            else:
+                raise ValueError(
+                    f"The current release does not supports {type} type. " "Please check type."
+                )
+        elif share_credentials_version == 3:
+            type = json["type"]
+            if type == "oauth_client_oidc_interactive":
+                issuer = json["issuer"]
+                if issuer is not None and issuer.endswith("/"):
+                    issuer = issuer[:-1]
+                return DeltaSharingProfile(
+                    share_credentials_version=share_credentials_version,
+                    type=type,
+                    endpoint=endpoint,
+                    issuer=issuer,
+                    client_id=json["clientId"],
+                    client_secret=json["clientSecret"],
                 )
             else:
                 raise ValueError(
